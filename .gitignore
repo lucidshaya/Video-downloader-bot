@@ -1,6 +1,5 @@
 outputs
 __pycache__
-config.py
 test.json
 venv
 .DS_Store
