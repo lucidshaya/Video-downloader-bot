@@ -20,6 +20,12 @@ import datetime
 import requests
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+import logging
+
+# Configure logging to stdout
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 # Vercel freezes the process immediately after response. 
 # Threading MUST be disabled so handlers run synchronously before we return.
@@ -104,13 +110,17 @@ def home():
 
 @app.route('/api/webhook', methods=['POST'])
 def webhook():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return ''
-    else:
-        return 'error', 403
+    try:
+        if request.headers.get('content-type') == 'application/json':
+            json_string = request.get_data().decode('utf-8')
+            update = telebot.types.Update.de_json(json_string)
+            bot.process_new_updates([update])
+            return ''
+        else:
+            return 'error', 403
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}")
+        return 'error', 500
 
 # --- Bot Handlers (Copied/Adapted) ---
 
