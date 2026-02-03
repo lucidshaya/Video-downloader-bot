@@ -51,19 +51,20 @@ def download_video_vercel(message, url, mode='best'):
         'outtmpl': f'{output_dir}/{timestamp}_%(id)s.%(ext)s',
         'quiet': True,
         'no_warnings': True,
-        'max_filesize': 45000000, # Lower limit for safety
-        # TIMEOUT PREVENTION:
-        # We try to download simpler formats that don't need merging (ffmpeg is missing usually)
-        'format': 'best[ext=mp4]/best' 
+        'max_filesize': 45000000, 
+        'format': 'best[ext=mp4]/best',
+        'cache_dir': '/tmp/yt-dlp-cache', # Fix for Read-only file system
+        'noplaylist': True
     }
     
     if mode == 'audio':
         ydl_opts['format'] = 'bestaudio/best'
-        # Cannot use FFmpegExtractAudio on Vercel without a custom build layer.
-        # We will download whatever audio we get.
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # Send status
+            status_msg = bot.send_message(chat_id, "⏳ Finding video...")
+            
             info = ydl.extract_info(url, download=True)
             
             # Find file
@@ -74,9 +75,12 @@ def download_video_vercel(message, url, mode='best'):
                     break
             
             if not target_file:
-                 raise Exception("Download failed or file not found.")
+                 bot.edit_message_text("❌ Download failed: File not found.", chat_id, status_msg.message_id)
+                 return
 
             # Upload
+            bot.edit_message_text("📤 Uploading...", chat_id, status_msg.message_id)
+            
             with open(target_file, 'rb') as f:
                 if mode == 'audio':
                     bot.send_audio(chat_id, f, caption=f"🎵 {info.get('title')}")
@@ -84,17 +88,11 @@ def download_video_vercel(message, url, mode='best'):
                     bot.send_video(chat_id, f, caption=f"🎬 {info.get('title')}")
             
             # Cleanup
+            bot.delete_message(chat_id, status_msg.message_id)
             os.remove(target_file)
-            try:
-                bot.delete_message(chat_id, message_id)
-            except: 
-                pass
 
     except Exception as e:
-        try:
-             bot.send_message(chat_id, f"❌ Error (Vercel Limitation): {str(e)[:50]}")
-        except:
-             pass
+        bot.send_message(chat_id, f"❌ Error: {str(e)}")
 
 # --- Routes ---
 
