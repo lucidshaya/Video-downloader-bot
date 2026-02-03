@@ -21,7 +21,9 @@ import requests
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 app = Flask(__name__)
-bot = telebot.TeleBot(config.token)
+# Vercel freezes the process immediately after response. 
+# Threading MUST be disabled so handlers run synchronously before we return.
+bot = telebot.TeleBot(config.token, threaded=False)
 
 # --- Re-use Logic (Simplified for Vercel Timeouts) ---
 # Vercel has strict timeouts (10s on Free). Large downloads WILL fail.
