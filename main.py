@@ -1,189 +1,356 @@
-from urllib.parse import urlparse
-import datetime
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import config
 import yt_dlp
 import re
 import os
-from telebot import types
-from telebot.util import quick_markup
 import time
+import datetime
+import requests
+from urllib.parse import urlparse
 
+# Initialize Bot
 bot = telebot.TeleBot(config.token)
+
+# --- Helpers ---
+
+def get_progress_bar(stauts_info):
+    """Generates a visual progress bar string."""
+    try:
+        if 'total_bytes' in stauts_info:
+            total = stauts_info['total_bytes']
+        elif 'total_bytes_estimate' in stauts_info:
+            total = stauts_info['total_bytes_estimate']
+        else:
+            return "⏳ Processing..."
+            
+        downloaded = stauts_info.get('downloaded_bytes', 0)
+        percentage = downloaded / total
+        
+        bar_len = 10
+        filled_len = int(bar_len * percentage)
+        bar = '▓' * filled_len + '░' * (bar_len - filled_len)
+        
+        percent_str = f"{percentage*100:.1f}%"
+        size_str = f"{total / 1024 / 1024:.1f}MB"
+        
+        return f"Downloading: {bar} {percent_str}\n📦 Size: {size_str}"
+    except:
+        return "⏳ Downloading..."
+
+def format_duration(seconds):
+    if not seconds: return "Unknown"
+    return str(datetime.timedelta(seconds=seconds))
+
+def clean_filename(title):
+    return "".join([c for c in title if c.isalpha() or c.isdigit() or c==' ']).strip()
+
+# --- Core Logic ---
+
 last_edited = {}
 
-def youtube_url_validation(url):
-    youtube_regex = (
-        r'(https?://)?(www\.)?'
-        r'(youtube|youtu|youtube-nocookie)\.(com|be)/'
-        r'(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})')
+def download_video_real(call, url, mode='best'):
+    """
+    Modes:
+    - 'best': Best video+audio
+    - 'mobile': 480p or lower
+    - 'audio': Audio only (mp3)
+    """
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    # Update status
+    bot.edit_message_caption(
+        chat_id=chat_id, 
+        message_id=message_id, 
+        caption=f"🚀 *Starting download...*\nMode: _{mode.title()}_", 
+        parse_mode="Markdown"
+    )
+    
+    output_dir = config.output_folder
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        
+    timestamp =  int(time.time())
+    
+    ydl_opts = {
+        'outtmpl': f'{output_dir}/{timestamp}_%(id)s.%(ext)s',
+        'quiet': True,
+        'no_warnings': True,
+        'max_filesize': config.max_filesize
+    }
 
-    youtube_regex_match = re.match(youtube_regex, url)
-    if youtube_regex_match:
-        return youtube_regex_match
+    # Configure Quality
+    if mode == 'audio':
+        ydl_opts.update({
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        })
+    elif mode == 'mobile':
+        # Try to find mp4 < 720p, else best
+        ydl_opts.update({'format': 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/best'})
+    else: # limit to 1080p to valid Telegram upload limits usually
+        ydl_opts.update({'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'})
 
-    return youtube_regex_match
+    # Progress Hook
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            key = f"{chat_id}-{message_id}"
+            now = time.time()
+            # Edit max every 2 seconds to avoid flood limits
+            if key not in last_edited or (now - last_edited[key] > 2):
+                try:
+                    bar = get_progress_bar(d)
+                    bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        caption=f"⬇️ *Downloading...*\n\n{bar}",
+                        parse_mode="Markdown"
+                    )
+                    last_edited[key] = now
+                except Exception:
+                    pass
+
+    ydl_opts['progress_hooks'] = [progress_hook]
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            
+            # Find the file
+            if mode == 'audio':
+                ext = 'mp3'
+            else:
+                ext = info['ext']
+                if mode == 'mobile' or mode == 'best': 
+                     # Sometimes merger changes ext, usually mp4/mkv. 
+                     # For simplicity, we search for the file created.
+                     pass
+            
+            # Yt-dlp 'entries' check for playlists (not supported fully here, take first)
+            if 'entries' in info:
+                info = info['entries'][0]
+
+            # Determine filepath. 
+            # Note: prepare_filename often gives the pre-merged name. 
+            # Simplest way is to look for files starting with timestamp in folder.
+            target_file = None
+            for f in os.listdir(output_dir):
+                if f.startswith(str(timestamp)):
+                    target_file = os.path.join(output_dir, f)
+                    break
+            
+            if not target_file:
+                raise Exception("File not found after download.")
+
+            # Upload
+            bot.edit_message_caption(
+                chat_id=chat_id, 
+                message_id=message_id, 
+                caption="📤 *Uploading to Telegram...*\n_This may take a moment._",
+                parse_mode="Markdown"
+            )
+            
+            with open(target_file, 'rb') as f:
+                if mode == 'audio':
+                    bot.send_audio(
+                        chat_id, f, 
+                        title=info.get('title', 'Audio'), 
+                        performer=info.get('uploader', 'Bot'),
+                        caption=f"🎵 *{info.get('title')}*\nVia @{bot.get_me().username}",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    # Get dimensions
+                    w = info.get('width')
+                    h = info.get('height')
+                    bot.send_video(
+                        chat_id, f,
+                        width=w, height=h,
+                        caption=f"🎬 *{info.get('title')}*\n✨ Quality: {mode.title()}\nVia @{bot.get_me().username}",
+                        parse_mode="Markdown"
+                    )
+            
+            # Cleanup
+            bot.delete_message(chat_id, message_id)
+            os.remove(target_file)
+
+    except Exception as e:
+        error_msg = str(e)
+        if "Too Large" in error_msg or "File is too big" in error_msg:
+             text = "❌ *File Too Large*\nTelegram bots are limited to 50MB uploads."
+        else:
+             text = f"❌ *Error Occurred*\n`{str(e)[:100]}...`"
+             
+        bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=text, parse_mode="Markdown")
+
+
+# --- Handlers ---
 
 @bot.message_handler(commands=['start', 'help'])
-def test(message):
-    bot.reply_to(
-        message, "*Send me a video link* and I'll download it for you, works with *YouTube*, *Twitter*, *TikTok*, *Reddit* and more.\n\n_Powered by_ [yt-dlp](https://github.com/yt-dlp/yt-dlp/)", parse_mode="MARKDOWN", disable_web_page_preview=True)
+def send_welcome(message):
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton("Developer", url="https://t.me/YourHandle")) # Optional
+    
+    welcome_text = (
+        f"👋 *Welcome, {message.from_user.first_name}!*\n\n"
+        "I am a *Premium Media Downloader Bot*. 🚀\n"
+        "Send me a link from:\n"
+        "• YouTube\n"
+        "• Instagram (Reels/Posts)\n"
+        "• TikTok\n"
+        "• Twitter / X\n"
+        "• Facebook\n\n"
+        "✨ *Features:*\n"
+        "• Select Quality (HD / Data Saver)\n"
+        "• Extract Audio (MP3)\n"
+        "• Fast & Free\n\n"
+        "👇 _Just paste a link to start!_"
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown", reply_markup=markup)
 
-def download_video(message, content, audio=False, format_id="mp4"):
+@bot.message_handler(func=lambda m: True)
+def handle_message(message):
+    text = message.text
+    if not text: return
 
-    url = re.search(r'https?://\S+', content).group(0) if re.search(r'https?://\S+', content) else content
+    # 1. Handle .ics (Legacy / Requested feature)
+    if text.lower().endswith('.ics') or '.ics?' in text.lower():
+         handle_ics_download(message)
+         return
 
-    url_info = urlparse(url)
-    if url_info.scheme:
-        if url_info.netloc in ['www.youtube.com', 'youtu.be', 'youtube.com', 'youtu.be']:
-            if not youtube_url_validation(url):
-                bot.reply_to(message, 'Invalid URL')
-                return
-
-        def progress(d):
-
-            if d['status'] == 'downloading':
-                try:
-                    update = False
-
-                    if last_edited.get(f"{message.chat.id}-{msg.message_id}"):
-                        if (datetime.datetime.now() - last_edited[f"{message.chat.id}-{msg.message_id}"]).total_seconds() >= 5:
-                            update = True
-                    else:
-                        update = True
-
-                    if update:
-                        perc = round(d['downloaded_bytes'] *
-                                     100 / d['total_bytes'])
-                        bot.edit_message_text(
-                            chat_id=message.chat.id, message_id=msg.message_id, text=f"Downloading {d['info_dict']['title']}\n\n{perc}%")
-                        last_edited[f"{message.chat.id}-{msg.message_id}"] = datetime.datetime.now()
-                except Exception as e:
-                    print(e)
-
-        msg = bot.reply_to(message, 'Downloading...')
-        video_title = round(time.time() * 1000)
-
-        with yt_dlp.YoutubeDL({'format': format_id, 'outtmpl': f'{config.output_folder}/{video_title}.%(ext)s', 'progress_hooks': [progress], 'postprocessors': [{  # Extract audio using ffmpeg
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-        }] if audio else [], 'max_filesize': config.max_filesize}) as ydl:
-            info = ydl.extract_info(url, download=True)
-
-            try:
-                bot.edit_message_text(
-                    chat_id=message.chat.id, message_id=msg.message_id, text='Sending file to Telegram...')
-                try:
-                    if audio:
-                        bot.send_audio(message.chat.id, open(
-                            info['requested_downloads'][0]['filepath'], 'rb'), reply_to_message_id=message.message_id)
-
-                    else:
-                        width = info['requested_downloads'][0]['width']
-                        height = info['requested_downloads'][0]['height']
-
-                        bot.send_video(message.chat.id, open(
-                            info['requested_downloads'][0]['filepath'], 'rb'), reply_to_message_id=message.message_id, width=width, height=height)
-                    bot.delete_message(message.chat.id, msg.message_id)
-                except Exception as e:
-                    bot.edit_message_text(
-                        chat_id=message.chat.id, message_id=msg.message_id, text=f"Couldn't send file, make sure it's supported by Telegram and it doesn't exceed *{round(config.max_filesize / 1000000)}MB*", parse_mode="MARKDOWN")
-
-            except Exception as e:
-                if isinstance(e, yt_dlp.utils.DownloadError):
-                    bot.edit_message_text(
-                        'Invalid URL', message.chat.id, msg.message_id)
-                else:
-                    bot.edit_message_text(
-                        f"There was an error downloading your video, make sure it doesn't exceed *{round(config.max_filesize / 1000000)}MB*", message.chat.id, msg.message_id, parse_mode="MARKDOWN")
-        for file in os.listdir(config.output_folder):
-            if file.startswith(str(video_title)):
-                os.remove(f'{config.output_folder}/{file}')
-    else: 
-        bot.reply_to(message, 'Invalid URL')
-
-def log(message, text: str, media: str):
-    if config.logs:
-        if message.chat.type == 'private':
-            chat_info = "Private chat"
-        else:
-            chat_info = f"Group: *{message.chat.title}* (`{message.chat.id}`)"
-
-        bot.send_message(
-            config.logs, f"Download request ({media}) from @{message.from_user.username} ({message.from_user.id})\n\n{chat_info}\n\n{text}")
-
-def get_text(message):
-    if len(message.text.split(' ')) < 2:
-        if message.reply_to_message and message.reply_to_message.text:
-            return message.reply_to_message.text
-
-        else:
-            return None
-    else:
-        return message.text.split(' ')[1]
-
-@bot.message_handler(commands=['download'])
-def download_command(message):
-    text = get_text(message)
-    if not text:
-        bot.reply_to(
-            message, 'Invalid usage, use `/download url`', parse_mode="MARKDOWN")
+    # 2. Check for URLs
+    url_match = re.search(r'(https?://\S+)', text)
+    if not url_match:
+        bot.reply_to(message, "⚠️ No valid link found. Please send a video URL.")
         return
+    
+    url = url_match.group(0)
+    
+    # 3. Fetch Info (Metadata)
+    status_msg = bot.reply_to(message, "🔎 *Analyzing Link...*", parse_mode="Markdown")
+    
+    try:
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            title = info.get('title', 'Unknown Title')
+            duration = format_duration(info.get('duration'))
+            uploader = info.get('uploader', 'Unknown Author')
+            thumbnail = info.get('thumbnail')
+            views = info.get('view_count', 0)
+            
+            # Prepare Menu
+            markup = InlineKeyboardMarkup()
+            markup.row(
+                InlineKeyboardButton("🎬 Best Quality", callback_data=f"dl|best|{url[:20]}"), # Shorten URL in data if needed, but we rely on state or re-parsing. 
+                # Note: Telegram Callback Data limit is 64 bytes. URLs are too long.
+                # SOLUTION: We will store the full URL in memory or just use the message text reference.
+                # BETTER: Just pass a tiny ID and store in dict? Or just Extract from reply_to text?
+                # Simplest for this context: Store URL in memory temporarily or re-read from msg.
+                # We'll use a hack: pass 'dl|mode' and read URL from the message being replied to (if we attached menu to it)
+                # But we are sending a NEW message with photo. 
+                # Let's simple use a global dict with key = message_id of the menu
+            )
+            markup.row(
+                InlineKeyboardButton("📱 Mobile (480p)", callback_data="dl|mobile"),
+                InlineKeyboardButton("🎵 Audio (MP3)", callback_data="dl|audio")
+            )
+            markup.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel"))
 
-    log(message, text, 'video')
-    download_video(message, text)
+            # Store URL mapping for this specific UI message
+            # The 'message_id' will be the one involved in the button click.
+            # But we don't know the message_id of the photo message until sent.
+            # So we send photo, GET message_id, then store.
+            
+            caption = (
+                f"🎬 *{title}*\n\n"
+                f"👤 *Channel:* {uploader}\n"
+                f"⏱ *Duration:* {duration}\n"
+                f"👁 *Views:* {views:,}\n\n"
+                "👇 *Select format:* "
+            )
+            
+            bot.delete_message(message.chat.id, status_msg.message_id) # Delete "Analyzing..."
+            
+            if thumbnail:
+                sent_msg = bot.send_photo(
+                    message.chat.id, 
+                    thumbnail, 
+                    caption=caption, 
+                    parse_mode="Markdown", 
+                    reply_markup=markup,
+                    reply_to_message_id=message.message_id
+                )
+            else:
+                sent_msg = bot.send_message(
+                    message.chat.id, 
+                    caption, 
+                    parse_mode="Markdown", 
+                    reply_markup=markup
+                )
+            
+            # Store the URL for this message interaction
+            # We use the bot's sent message ID as key
+            url_storage[sent_msg.message_id] = url
 
+    except Exception as e:
+        bot.edit_message_text(f"⚠️ *Invalid Link or Error*\n`{str(e)}`", message.chat.id, status_msg.message_id, parse_mode="Markdown")
 
-@bot.message_handler(commands=['audio'])
-def download_audio_command(message):
-    text = get_text(message)
-    if not text:
-        bot.reply_to(
-            message, 'Invalid usage, use `/audio url`', parse_mode="MARKDOWN")
-        return
-
-    log(message, text, 'audio')
-    download_video(message, text, True)
-
-@bot.message_handler(commands=['custom'])
-def custom(message):
-    text = get_text(message)
-    if not text:
-        bot.reply_to(
-            message, 'Invalid usage, use `/custom url`', parse_mode="MARKDOWN")
-        return
-
-    msg = bot.reply_to(message, 'Getting formats...')
-
-    with yt_dlp.YoutubeDL() as ydl:
-        info = ydl.extract_info(text, download=False)
-
-    data = {f"{x['resolution']}.{x['ext']}": {
-        'callback_data': f"{x['format_id']}"} for x in info['formats'] if x['video_ext'] != 'none'}
-
-    markup = quick_markup(data, row_width=2)
-
-    bot.delete_message(msg.chat.id, msg.message_id)
-    bot.reply_to(message, "Choose a format", reply_markup=markup)
-
+# Global storage for URLs linked to menu messages
+url_storage = {} 
 
 @bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    if call.from_user.id == call.message.reply_to_message.from_user.id:
-        url = get_text(call.message.reply_to_message)
+def handle_query(call):
+    data = call.data
+    
+    if data == "cancel":
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        download_video(call.message.reply_to_message, url,
-                       format_id=f"{call.data}+bestaudio")
-    else:
-        bot.answer_callback_query(call.id, "You didn't send the request")
-
-@bot.message_handler(func=lambda m: True, content_types=["text", "pinned_message", "photo", "audio", "video", "location", "contact", "voice", "document"])
-def handle_private_messages(message):
-    text = message.text if message.text else message.caption if message.caption else None
-
-    if message.chat.type == 'private':
-        log(message, text, 'video')
-        download_video(message, text)
         return
 
+    if data.startswith("dl|"):
+        mode = data.split("|")[1]
+        
+        # Retrieve URL
+        url = url_storage.get(call.message.message_id)
+        if not url:
+            bot.answer_callback_query(call.id, "❌ Session expired. Please send link again.")
+            return
+            
+        # Clean storage
+        del url_storage[call.message.message_id]
+        
+        download_video_real(call, url, mode)
+
+def handle_ics_download(message):
+    # (Same ICS logic as before, just wrapped)
+    url_match = re.search(r'(https?://\S+)', message.text)
+    if not url_match: return
+    url = url_match.group(0)
+    
+    if not os.path.exists(config.output_folder):
+        os.makedirs(config.output_folder)
+        
+    try:
+        msg = bot.reply_to(message, '📅 *Downloading iCalendar...*', parse_mode="Markdown")
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            filename = url.split('/')[-1].split('?')[0] or "calendar.ics"
+            filepath = os.path.join(config.output_folder, filename)
+            with open(filepath, 'wb') as f: f.write(response.content)
+            
+            bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text='📤 Sending file...')
+            with open(filepath, 'rb') as f:
+                bot.send_document(message.chat.id, f)
+            
+            bot.delete_message(message.chat.id, msg.message_id)
+            os.remove(filepath)
+    except Exception as e:
+        bot.edit_message_text(f'❌ Error: {e}', message.chat.id, message.message_id)
+
+print("Premium Bot Started...")
 bot.infinity_polling()
